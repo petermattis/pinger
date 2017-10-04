@@ -1,15 +1,9 @@
 package main
 
 import (
-	"bufio"
-	"crypto/rand"
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"math"
-	"net"
 	"os"
 	"os/signal"
 	"runtime/pprof"
@@ -18,9 +12,7 @@ import (
 	"time"
 
 	"github.com/codahale/hdrhistogram"
-	"github.com/gogo/protobuf/proto"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
@@ -32,107 +24,6 @@ var serverPayload = flag.Int("s", 10, "")
 var typ = flag.String("t", "grpc", "")
 var duration = flag.Duration("d", 0, "")
 var cpuprof = flag.String("cpuprof", "", "")
-
-type pinger struct {
-	payload []byte
-}
-
-func newPinger() *pinger {
-	payload := make([]byte, *serverPayload)
-	_, _ = rand.Read(payload)
-	return &pinger{payload: payload}
-}
-
-func (p *pinger) Ping(_ context.Context, req *PingRequest) (*PingResponse, error) {
-	return &PingResponse{Payload: p.payload}, nil
-}
-
-type xServerConn struct {
-	conn net.Conn
-
-	sender struct {
-		sync.Mutex
-		cond    sync.Cond
-		wr      *bufio.Writer
-		pending []*pending
-	}
-}
-
-func (x *xServerConn) readLoop() {
-	payload := make([]byte, *serverPayload)
-	_, _ = rand.Read(payload)
-
-	rd := bufio.NewReader(x.conn)
-	header := make([]byte, 12)
-
-	for {
-		if _, err := io.ReadFull(rd, header); err != nil {
-			log.Fatal(err)
-		}
-		size := binary.LittleEndian.Uint32(header[:4])
-		seq := binary.LittleEndian.Uint64(header[4:12])
-		req := make([]byte, size)
-		if _, err := io.ReadFull(rd, req); err != nil {
-			log.Fatal(err)
-		}
-		go func() {
-			x.send(seq, &PingResponse{Payload: payload})
-		}()
-	}
-}
-
-func (x *xServerConn) writeLoop() {
-	s := &x.sender
-	header := make([]byte, 12)
-
-	for {
-		s.Lock()
-		for len(s.pending) == 0 {
-			s.cond.Wait()
-		}
-		pending := s.pending
-		s.pending = nil
-		s.Unlock()
-
-		for _, p := range pending {
-			binary.LittleEndian.PutUint32(header[:4], uint32(len(p.data)))
-			binary.LittleEndian.PutUint64(header[4:12], p.seq)
-			if _, err := s.wr.Write(header); err != nil {
-				log.Fatal(err)
-			}
-			if _, err := s.wr.Write(p.data); err != nil {
-				log.Fatal(err)
-			}
-		}
-
-		if err := s.wr.Flush(); err != nil {
-			log.Fatal(err)
-		}
-	}
-}
-
-func (x *xServerConn) send(seq uint64, m proto.Message) {
-	d, err := proto.Marshal(m)
-	if err != nil {
-		log.Fatal(err)
-	}
-	p := &pending{data: d}
-	p.seq = seq
-
-	s := &x.sender
-	s.Lock()
-	s.pending = append(s.pending, p)
-	s.cond.Signal()
-	s.Unlock()
-}
-
-func doXConn(conn net.Conn) {
-	x := &xServerConn{conn: conn}
-	x.sender.cond.L = &x.sender.Mutex
-	x.sender.wr = bufio.NewWriter(conn)
-	go x.readLoop()
-	go x.writeLoop()
-}
 
 func doServer(port string) {
 	if *cpuprof != "" {
@@ -156,33 +47,10 @@ func doServer(port string) {
 
 	switch *typ {
 	case "grpc":
-		lis, err := net.Listen("tcp", port)
-		if err != nil {
-			log.Fatalf("failed to listen: %v", err)
-		}
-		s := grpc.NewServer(
-			grpc.MaxMsgSize(math.MaxInt32),
-			grpc.MaxConcurrentStreams(math.MaxInt32),
-			grpc.InitialWindowSize(65535),
-			grpc.InitialConnWindowSize(65535),
-		)
-		RegisterPingerServer(s, newPinger())
-		if err := s.Serve(lis); err != nil {
-			log.Fatalf("failed to serve: %v", err)
-		}
+		doGrpcServer(port)
 
 	case "x":
-		lis, err := net.Listen("tcp", port)
-		if err != nil {
-			log.Fatalf("failed to listen: %v", err)
-		}
-		for {
-			conn, err := lis.Accept()
-			if err != nil {
-				log.Fatal(err)
-			}
-			go doXConn(conn)
-		}
+		doXServer(port)
 
 	default:
 		log.Fatalf("unknown type: %s", *typ)
@@ -211,158 +79,6 @@ var stats struct {
 	bytes   uint64
 }
 
-func grpcWorker(c PingerClient) {
-	payload := make([]byte, *clientPayload)
-	_, _ = rand.Read(payload)
-
-	for {
-		start := time.Now()
-		resp, err := c.Ping(context.TODO(), &PingRequest{Payload: payload})
-		if err != nil {
-			log.Fatal(err)
-		}
-		elapsed := clampLatency(time.Since(start), minLatency, maxLatency)
-		stats.Lock()
-		if err := stats.latency.Current.RecordValue(elapsed.Nanoseconds()); err != nil {
-			log.Fatal(err)
-		}
-		stats.ops++
-		stats.bytes += uint64(len(payload) + len(resp.Payload))
-		stats.Unlock()
-	}
-}
-
-type pending struct {
-	seq  uint64
-	data []byte
-	resp []byte
-	wg   sync.WaitGroup
-}
-
-type xClientConn struct {
-	conn   net.Conn
-	sender struct {
-		sync.Mutex
-		cond    sync.Cond
-		wr      *bufio.Writer
-		pending []*pending
-	}
-	receiver struct {
-		sync.Mutex
-		seq     uint64
-		pending map[uint64]*pending
-	}
-}
-
-func newXClient(conn net.Conn) *xClientConn {
-	x := &xClientConn{
-		conn: conn,
-	}
-	x.sender.wr = bufio.NewWriter(conn)
-	x.sender.cond.L = &x.sender.Mutex
-	x.receiver.seq = 1
-	x.receiver.pending = make(map[uint64]*pending)
-	return x
-}
-
-func (x *xClientConn) readLoop() {
-	r := &x.receiver
-	rd := bufio.NewReader(x.conn)
-	header := make([]byte, 12)
-
-	for {
-		if _, err := io.ReadFull(rd, header); err != nil {
-			log.Fatal(err)
-		}
-		size := binary.LittleEndian.Uint32(header[:4])
-		seq := binary.LittleEndian.Uint64(header[4:12])
-		resp := make([]byte, size)
-		if _, err := io.ReadFull(rd, resp); err != nil {
-			log.Fatal(err)
-		}
-
-		r.Lock()
-		p := r.pending[seq]
-		delete(r.pending, seq)
-		r.Unlock()
-		p.resp = resp
-		p.wg.Done()
-	}
-}
-
-func (x *xClientConn) writeLoop() {
-	s := &x.sender
-	header := make([]byte, 12)
-
-	for {
-		s.Lock()
-		for len(s.pending) == 0 {
-			s.cond.Wait()
-		}
-		pending := s.pending
-		s.pending = nil
-		s.Unlock()
-
-		for _, p := range pending {
-			binary.LittleEndian.PutUint32(header[:4], uint32(len(p.data)))
-			binary.LittleEndian.PutUint64(header[4:12], p.seq)
-			if _, err := s.wr.Write(header); err != nil {
-				log.Fatal(err)
-			}
-			if _, err := s.wr.Write(p.data); err != nil {
-				log.Fatal(err)
-			}
-		}
-
-		if err := s.wr.Flush(); err != nil {
-			log.Fatal(err)
-		}
-	}
-}
-
-func (x *xClientConn) send(m proto.Message) []byte {
-	d, err := proto.Marshal(m)
-	if err != nil {
-		log.Fatal(err)
-	}
-	p := &pending{data: d}
-	p.wg.Add(1)
-
-	r := &x.receiver
-	r.Lock()
-	p.seq = r.seq
-	r.seq++
-	r.pending[p.seq] = p
-	r.Unlock()
-
-	s := &x.sender
-	s.Lock()
-	s.pending = append(s.pending, p)
-	s.cond.Signal()
-	s.Unlock()
-
-	p.wg.Wait()
-	return p.resp
-}
-
-func xWorker(x *xClientConn) {
-	payload := make([]byte, *clientPayload)
-	_, _ = rand.Read(payload)
-
-	for {
-		start := time.Now()
-		resp := x.send(&PingRequest{Payload: payload})
-		elapsed := clampLatency(time.Since(start), minLatency, maxLatency)
-		stats.Lock()
-		if err := stats.latency.Current.RecordValue(elapsed.Nanoseconds()); err != nil {
-			log.Fatal(err)
-		}
-		stats.ops++
-		stats.bytes += uint64(len(payload) + len(resp))
-		stats.Unlock()
-	}
-}
-
 func doClient() {
 	addr := "localhost:50051"
 	if args := flag.Args(); len(args) > 0 {
@@ -374,39 +90,10 @@ func doClient() {
 
 	switch *typ {
 	case "grpc":
-		clients := make([]PingerClient, *connections)
-		for i := 0; i < len(clients); i++ {
-			conn, err := grpc.Dial(addr,
-				grpc.WithInsecure(),
-				grpc.WithBlock(),
-				grpc.WithInitialWindowSize(65535),
-				grpc.WithInitialConnWindowSize(65535),
-			)
-			if err != nil {
-				log.Fatal(err)
-			}
-			defer conn.Close()
-			clients[i] = NewPingerClient(conn)
-		}
-
-		for i := 0; i < *concurrency; i++ {
-			go grpcWorker(clients[i%len(clients)])
-		}
+		doGrpcClient(addr)
 
 	case "x":
-		clients := make([]*xClientConn, *connections)
-		for i := 0; i < *connections; i++ {
-			conn, err := net.Dial("tcp", addr)
-			if err != nil {
-				log.Fatal(err)
-			}
-			clients[i] = newXClient(conn)
-			go clients[i].readLoop()
-			go clients[i].writeLoop()
-		}
-		for i := 0; i < *concurrency; i++ {
-			go xWorker(clients[i%len(clients)])
-		}
+		doXClient(addr)
 
 	default:
 		log.Fatalf("unknown type: %s", *typ)
