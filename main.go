@@ -48,74 +48,22 @@ func (p *pinger) Ping(_ context.Context, req *PingRequest) (*PingResponse, error
 }
 
 type xServerConn struct {
+	conn net.Conn
+
 	sender struct {
 		sync.Mutex
-		cond      sync.Cond
-		wr        *bufio.Writer
-		sending   bool
-		headerBuf [12]byte
-		pending   []*pending
+		cond    sync.Cond
+		wr      *bufio.Writer
+		pending []*pending
 	}
 }
 
-func (x *xServerConn) send(seq uint64, m proto.Message) {
-	d, err := proto.Marshal(m)
-	if err != nil {
-		log.Fatal(err)
-	}
-	p := &pending{data: d}
-	p.seq = seq
-
-	s := &x.sender
-	s.Lock()
-	leader := len(s.pending) == 0
-	s.pending = append(s.pending, p)
-
-	if leader {
-		// We're the leader. Wait for any send to finish.
-		for s.sending {
-			s.cond.Wait()
-		}
-		pending := s.pending
-		s.pending = nil
-		s.sending = true
-		s.Unlock()
-
-		for _, p := range pending {
-			header := s.headerBuf[:12]
-			binary.LittleEndian.PutUint32(header[:4], uint32(len(p.data)))
-			binary.LittleEndian.PutUint64(header[4:12], p.seq)
-			if _, err := s.wr.Write(header); err != nil {
-				log.Fatal(err)
-			}
-			if _, err := s.wr.Write(p.data); err != nil {
-				log.Fatal(err)
-			}
-		}
-
-		s.Lock()
-		s.sending = false
-		s.cond.Signal()
-
-		if len(s.pending) == 0 {
-			if err := s.wr.Flush(); err != nil {
-				log.Fatal(err)
-			}
-		}
-	}
-
-	s.Unlock()
-}
-
-func doXConn(conn net.Conn) {
+func (x *xServerConn) readLoop() {
 	payload := make([]byte, *serverPayload)
 	_, _ = rand.Read(payload)
 
-	rd := bufio.NewReader(conn)
+	rd := bufio.NewReader(x.conn)
 	header := make([]byte, 12)
-	x := &xServerConn{}
-	x.sender.cond.L = &x.sender.Mutex
-	x.sender.wr = bufio.NewWriter(conn)
 
 	for {
 		if _, err := io.ReadFull(rd, header); err != nil {
@@ -131,6 +79,59 @@ func doXConn(conn net.Conn) {
 			x.send(seq, &PingResponse{Payload: payload})
 		}()
 	}
+}
+
+func (x *xServerConn) writeLoop() {
+	s := &x.sender
+	header := make([]byte, 12)
+
+	for {
+		s.Lock()
+		for len(s.pending) == 0 {
+			s.cond.Wait()
+		}
+		pending := s.pending
+		s.pending = nil
+		s.Unlock()
+
+		for _, p := range pending {
+			binary.LittleEndian.PutUint32(header[:4], uint32(len(p.data)))
+			binary.LittleEndian.PutUint64(header[4:12], p.seq)
+			if _, err := s.wr.Write(header); err != nil {
+				log.Fatal(err)
+			}
+			if _, err := s.wr.Write(p.data); err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		if err := s.wr.Flush(); err != nil {
+			log.Fatal(err)
+		}
+	}
+}
+
+func (x *xServerConn) send(seq uint64, m proto.Message) {
+	d, err := proto.Marshal(m)
+	if err != nil {
+		log.Fatal(err)
+	}
+	p := &pending{data: d}
+	p.seq = seq
+
+	s := &x.sender
+	s.Lock()
+	s.pending = append(s.pending, p)
+	s.cond.Signal()
+	s.Unlock()
+}
+
+func doXConn(conn net.Conn) {
+	x := &xServerConn{conn: conn}
+	x.sender.cond.L = &x.sender.Mutex
+	x.sender.wr = bufio.NewWriter(conn)
+	go x.readLoop()
+	go x.writeLoop()
 }
 
 func doServer(port string) {
@@ -242,11 +243,9 @@ type xClientConn struct {
 	conn   net.Conn
 	sender struct {
 		sync.Mutex
-		cond      sync.Cond
-		wr        *bufio.Writer
-		sending   bool
-		headerBuf [12]byte
-		pending   []*pending
+		cond    sync.Cond
+		wr      *bufio.Writer
+		pending []*pending
 	}
 	receiver struct {
 		sync.Mutex
@@ -291,6 +290,36 @@ func (x *xClientConn) readLoop() {
 	}
 }
 
+func (x *xClientConn) writeLoop() {
+	s := &x.sender
+	header := make([]byte, 12)
+
+	for {
+		s.Lock()
+		for len(s.pending) == 0 {
+			s.cond.Wait()
+		}
+		pending := s.pending
+		s.pending = nil
+		s.Unlock()
+
+		for _, p := range pending {
+			binary.LittleEndian.PutUint32(header[:4], uint32(len(p.data)))
+			binary.LittleEndian.PutUint64(header[4:12], p.seq)
+			if _, err := s.wr.Write(header); err != nil {
+				log.Fatal(err)
+			}
+			if _, err := s.wr.Write(p.data); err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		if err := s.wr.Flush(); err != nil {
+			log.Fatal(err)
+		}
+	}
+}
+
 func (x *xClientConn) send(m proto.Message) []byte {
 	d, err := proto.Marshal(m)
 	if err != nil {
@@ -308,45 +337,11 @@ func (x *xClientConn) send(m proto.Message) []byte {
 
 	s := &x.sender
 	s.Lock()
-	leader := len(s.pending) == 0
 	s.pending = append(s.pending, p)
-
-	if leader {
-		// We're the leader. Wait for any send to finish.
-		for s.sending {
-			s.cond.Wait()
-		}
-		pending := s.pending
-		s.pending = nil
-		s.sending = true
-		s.Unlock()
-
-		for _, p := range pending {
-			header := s.headerBuf[:12]
-			binary.LittleEndian.PutUint32(header[:4], uint32(len(p.data)))
-			binary.LittleEndian.PutUint64(header[4:12], p.seq)
-			if _, err := s.wr.Write(header); err != nil {
-				log.Fatal(err)
-			}
-			if _, err := s.wr.Write(p.data); err != nil {
-				log.Fatal(err)
-			}
-		}
-
-		s.Lock()
-		s.sending = false
-		s.cond.Signal()
-
-		if len(s.pending) == 0 {
-			if err := s.wr.Flush(); err != nil {
-				log.Fatal(err)
-			}
-		}
-	}
-
+	s.cond.Signal()
 	s.Unlock()
-	p.wg.Wait()
 
+	p.wg.Wait()
 	return p.resp
 }
 
@@ -407,6 +402,7 @@ func doClient() {
 			}
 			clients[i] = newXClient(conn)
 			go clients[i].readLoop()
+			go clients[i].writeLoop()
 		}
 		for i := 0; i < *concurrency; i++ {
 			go xWorker(clients[i%len(clients)])
