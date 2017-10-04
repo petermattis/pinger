@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/codahale/hdrhistogram"
+	"github.com/gogo/protobuf/proto"
 
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -43,21 +47,89 @@ func (p *pinger) Ping(_ context.Context, req *PingRequest) (*PingResponse, error
 	return &PingResponse{Payload: p.payload}, nil
 }
 
-func doServerConn(conn net.Conn) {
-	defer conn.Close()
+type xServerConn struct {
+	sender struct {
+		sync.Mutex
+		cond      sync.Cond
+		wr        *bufio.Writer
+		sending   bool
+		headerBuf [12]byte
+		pending   []*pending
+	}
+}
 
-	buf := make([]byte, 1024)
+func (x *xServerConn) send(seq uint64, m proto.Message) {
+	d, err := proto.Marshal(m)
+	if err != nil {
+		log.Fatal(err)
+	}
+	p := &pending{data: d}
+	p.seq = seq
+
+	s := &x.sender
+	s.Lock()
+	leader := len(s.pending) == 0
+	s.pending = append(s.pending, p)
+
+	if leader {
+		// We're the leader. Wait for any send to finish.
+		for s.sending {
+			s.cond.Wait()
+		}
+		pending := s.pending
+		s.pending = nil
+		s.sending = true
+		s.Unlock()
+
+		for _, p := range pending {
+			header := s.headerBuf[:12]
+			binary.LittleEndian.PutUint32(header[:4], uint32(len(p.data)))
+			binary.LittleEndian.PutUint64(header[4:12], p.seq)
+			if _, err := s.wr.Write(header); err != nil {
+				log.Fatal(err)
+			}
+			if _, err := s.wr.Write(p.data); err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		s.Lock()
+		s.sending = false
+		s.cond.Signal()
+
+		if len(s.pending) == 0 {
+			if err := s.wr.Flush(); err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
+
+	s.Unlock()
+}
+
+func doXConn(conn net.Conn) {
+	payload := make([]byte, *serverPayload)
+	_, _ = rand.Read(payload)
+
+	rd := bufio.NewReader(conn)
+	header := make([]byte, 12)
+	x := &xServerConn{}
+	x.sender.cond.L = &x.sender.Mutex
+	x.sender.wr = bufio.NewWriter(conn)
+
 	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			log.Printf("%s", err)
-			return
+		if _, err := io.ReadFull(rd, header); err != nil {
+			log.Fatal(err)
 		}
-		n, err = conn.Write(buf[:n])
-		if err != nil {
-			log.Printf("%s", err)
-			return
+		size := binary.LittleEndian.Uint32(header[:4])
+		seq := binary.LittleEndian.Uint64(header[4:12])
+		req := make([]byte, size)
+		if _, err := io.ReadFull(rd, req); err != nil {
+			log.Fatal(err)
 		}
+		go func() {
+			x.send(seq, &PingResponse{Payload: payload})
+		}()
 	}
 }
 
@@ -98,7 +170,7 @@ func doServer(port string) {
 			log.Fatalf("failed to serve: %v", err)
 		}
 
-	case "tcp":
+	case "x":
 		lis, err := net.Listen("tcp", port)
 		if err != nil {
 			log.Fatalf("failed to listen: %v", err)
@@ -108,28 +180,7 @@ func doServer(port string) {
 			if err != nil {
 				log.Fatal(err)
 			}
-			go doServerConn(conn)
-		}
-
-	case "udp":
-		addr, err := net.ResolveUDPAddr("udp", port)
-		if err != nil {
-			log.Fatal(err)
-		}
-		conn, err := net.ListenUDP("udp", addr)
-		if err != nil {
-			log.Fatal(err)
-		}
-		buf := make([]byte, 1024)
-		for {
-			n, addr, err := conn.ReadFrom(buf)
-			if err != nil {
-				log.Fatal(err)
-			}
-			n, err = conn.WriteTo(buf[:n], addr)
-			if err != nil {
-				log.Fatal(err)
-			}
+			go doXConn(conn)
 		}
 
 	default:
@@ -180,60 +231,139 @@ func grpcWorker(c PingerClient) {
 	}
 }
 
-func tcpWorker(conn net.Conn) {
-	payload := make([]byte, *clientPayload)
-	buf := make([]byte, 1024)
-	_, _ = rand.Read(payload)
+type pending struct {
+	seq  uint64
+	data []byte
+	resp []byte
+	wg   sync.WaitGroup
+}
 
-	for {
-		start := time.Now()
-		n, err := conn.Write(payload)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if n != len(payload) {
-			log.Fatalf("truncated write: %d != %d", n, len(payload))
-		}
-		n, err = conn.Read(buf)
-		if err != nil {
-			log.Fatal(err)
-		}
-		elapsed := clampLatency(time.Since(start), minLatency, maxLatency)
-		stats.Lock()
-		if err := stats.latency.Current.RecordValue(elapsed.Nanoseconds()); err != nil {
-			log.Fatal(err)
-		}
-		stats.ops++
-		stats.bytes += uint64(len(payload) + n)
-		stats.Unlock()
+type xClientConn struct {
+	conn   net.Conn
+	sender struct {
+		sync.Mutex
+		cond      sync.Cond
+		wr        *bufio.Writer
+		sending   bool
+		headerBuf [12]byte
+		pending   []*pending
+	}
+	receiver struct {
+		sync.Mutex
+		seq     uint64
+		pending map[uint64]*pending
 	}
 }
 
-func udpWorker(conn *net.UDPConn, addr *net.UDPAddr) {
+func newXClient(conn net.Conn) *xClientConn {
+	x := &xClientConn{
+		conn: conn,
+	}
+	x.sender.wr = bufio.NewWriter(conn)
+	x.sender.cond.L = &x.sender.Mutex
+	x.receiver.seq = 1
+	x.receiver.pending = make(map[uint64]*pending)
+	return x
+}
+
+func (x *xClientConn) readLoop() {
+	r := &x.receiver
+	rd := bufio.NewReader(x.conn)
+	header := make([]byte, 12)
+
+	for {
+		if _, err := io.ReadFull(rd, header); err != nil {
+			log.Fatal(err)
+		}
+		size := binary.LittleEndian.Uint32(header[:4])
+		seq := binary.LittleEndian.Uint64(header[4:12])
+		resp := make([]byte, size)
+		if _, err := io.ReadFull(rd, resp); err != nil {
+			log.Fatal(err)
+		}
+
+		r.Lock()
+		p := r.pending[seq]
+		delete(r.pending, seq)
+		r.Unlock()
+		p.resp = resp
+		p.wg.Done()
+	}
+}
+
+func (x *xClientConn) send(m proto.Message) []byte {
+	d, err := proto.Marshal(m)
+	if err != nil {
+		log.Fatal(err)
+	}
+	p := &pending{data: d}
+	p.wg.Add(1)
+
+	r := &x.receiver
+	r.Lock()
+	p.seq = r.seq
+	r.seq++
+	r.pending[p.seq] = p
+	r.Unlock()
+
+	s := &x.sender
+	s.Lock()
+	leader := len(s.pending) == 0
+	s.pending = append(s.pending, p)
+
+	if leader {
+		// We're the leader. Wait for any send to finish.
+		for s.sending {
+			s.cond.Wait()
+		}
+		pending := s.pending
+		s.pending = nil
+		s.sending = true
+		s.Unlock()
+
+		for _, p := range pending {
+			header := s.headerBuf[:12]
+			binary.LittleEndian.PutUint32(header[:4], uint32(len(p.data)))
+			binary.LittleEndian.PutUint64(header[4:12], p.seq)
+			if _, err := s.wr.Write(header); err != nil {
+				log.Fatal(err)
+			}
+			if _, err := s.wr.Write(p.data); err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		s.Lock()
+		s.sending = false
+		s.cond.Signal()
+
+		if len(s.pending) == 0 {
+			if err := s.wr.Flush(); err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
+
+	s.Unlock()
+	p.wg.Wait()
+
+	return p.resp
+}
+
+func xWorker(x *xClientConn) {
 	payload := make([]byte, *clientPayload)
-	buf := make([]byte, 1024)
 	_, _ = rand.Read(payload)
 
 	for {
 		start := time.Now()
-		n, err := conn.WriteTo(payload, addr)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if n != len(payload) {
-			log.Fatalf("truncated write: %d != %d", n, len(payload))
-		}
-		n, _, err = conn.ReadFrom(buf)
-		if err != nil {
-			log.Fatal(err)
-		}
+		resp := x.send(&PingRequest{Payload: payload})
 		elapsed := clampLatency(time.Since(start), minLatency, maxLatency)
 		stats.Lock()
 		if err := stats.latency.Current.RecordValue(elapsed.Nanoseconds()); err != nil {
 			log.Fatal(err)
 		}
 		stats.ops++
-		stats.bytes += uint64(len(payload) + n)
+		stats.bytes += uint64(len(payload) + len(resp))
 		stats.Unlock()
 	}
 }
@@ -268,31 +398,18 @@ func doClient() {
 			go grpcWorker(clients[i%len(clients)])
 		}
 
-	case "tcp":
-		for i := 0; i < *concurrency; i++ {
+	case "x":
+		clients := make([]*xClientConn, *connections)
+		for i := 0; i < *connections; i++ {
 			conn, err := net.Dial("tcp", addr)
 			if err != nil {
 				log.Fatal(err)
 			}
-			go tcpWorker(conn)
+			clients[i] = newXClient(conn)
+			go clients[i].readLoop()
 		}
-
-	case "udp":
-		serverAddr, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			log.Fatal(err)
-		}
-
 		for i := 0; i < *concurrency; i++ {
-			localAddr, err := net.ResolveUDPAddr("udp", ":0")
-			if err != nil {
-				log.Fatal(err)
-			}
-			conn, err := net.ListenUDP("udp", localAddr)
-			if err != nil {
-				log.Fatal(err)
-			}
-			go udpWorker(conn, serverAddr)
+			go xWorker(clients[i%len(clients)])
 		}
 
 	default:
