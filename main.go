@@ -52,6 +52,9 @@ func doServer(port string) {
 	case "x":
 		doXServer(port)
 
+	case "y":
+		doYServer(port)
+
 	default:
 		log.Fatalf("unknown type: %s", *typ)
 	}
@@ -94,6 +97,9 @@ func doClient() {
 
 	case "x":
 		doXClient(addr)
+
+	case "y":
+		doYClient(addr)
 
 	default:
 		log.Fatalf("unknown type: %s", *typ)
@@ -194,6 +200,7 @@ func doClient() {
 
 func main() {
 	grpc.EnableTracing = false
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	flag.Parse()
 
 	if *listen != "" {

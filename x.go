@@ -20,7 +20,7 @@ type xServerConn struct {
 		sync.Mutex
 		cond    sync.Cond
 		wr      *bufio.Writer
-		pending []*pending
+		pending []*xPending
 	}
 }
 
@@ -82,7 +82,7 @@ func (x *xServerConn) send(seq uint64, m proto.Message) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	p := &pending{data: d}
+	p := &xPending{data: d}
 	p.seq = seq
 
 	s := &x.sender
@@ -110,7 +110,7 @@ func doXServer(port string) {
 	}
 }
 
-type pending struct {
+type xPending struct {
 	seq  uint64
 	data []byte
 	resp []byte
@@ -123,12 +123,12 @@ type xClientConn struct {
 		sync.Mutex
 		cond    sync.Cond
 		wr      *bufio.Writer
-		pending []*pending
+		pending []*xPending
 	}
 	receiver struct {
 		sync.Mutex
 		seq     uint64
-		pending map[uint64]*pending
+		pending map[uint64]*xPending
 	}
 }
 
@@ -139,7 +139,7 @@ func newXClient(conn net.Conn) *xClientConn {
 	x.sender.wr = bufio.NewWriter(conn)
 	x.sender.cond.L = &x.sender.Mutex
 	x.receiver.seq = 1
-	x.receiver.pending = make(map[uint64]*pending)
+	x.receiver.pending = make(map[uint64]*xPending)
 	return x
 }
 
@@ -203,7 +203,7 @@ func (x *xClientConn) send(m proto.Message) []byte {
 	if err != nil {
 		log.Fatal(err)
 	}
-	p := &pending{data: d}
+	p := &xPending{data: d}
 	p.wg.Add(1)
 
 	r := &x.receiver
