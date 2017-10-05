@@ -75,7 +75,6 @@ func doGrpcClient(addr string) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer conn.Close()
 		clients[i] = NewPingerClient(conn)
 	}
 

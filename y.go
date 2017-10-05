@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"flag"
 	"log"
 	"net"
 	"sync"
@@ -13,6 +14,8 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
+
+var sendHeaders = flag.Bool("h", true, "send http2 headers frame")
 
 type yServerConn struct {
 	conn net.Conn
@@ -33,6 +36,7 @@ func newYServer(conn net.Conn) *yServerConn {
 	y.wr = bufio.NewWriter(conn)
 	y.fr = http2.NewFramer(y.wr, y.rd)
 	y.fr.SetReuseFrames()
+	y.fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
 	y.sender.cond.L = &y.sender.Mutex
 	return y
 }
@@ -90,19 +94,21 @@ func (y *yServerConn) writeLoop() {
 		s.Unlock()
 
 		for _, p := range pending {
-			buf.Reset()
-			for _, f := range headers {
-				if err := enc.WriteField(f); err != nil {
+			if *sendHeaders {
+				buf.Reset()
+				for _, f := range headers {
+					if err := enc.WriteField(f); err != nil {
+						log.Fatal(err)
+					}
+				}
+				if err := y.fr.WriteHeaders(http2.HeadersFrameParam{
+					StreamID:      p.streamID,
+					BlockFragment: buf.Bytes(),
+					EndStream:     false,
+					EndHeaders:    true,
+				}); err != nil {
 					log.Fatal(err)
 				}
-			}
-			if err := y.fr.WriteHeaders(http2.HeadersFrameParam{
-				StreamID:      p.streamID,
-				BlockFragment: buf.Bytes(),
-				EndStream:     false,
-				EndHeaders:    true,
-			}); err != nil {
-				log.Fatal(err)
 			}
 
 			if err := y.fr.WriteData(p.streamID, true, p.data); err != nil {
@@ -179,6 +185,7 @@ func newYClient(conn net.Conn) *yClientConn {
 	y.wr = bufio.NewWriter(conn)
 	y.fr = http2.NewFramer(y.wr, y.rd)
 	y.fr.SetReuseFrames()
+	y.fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
 	y.sender.cond.L = &y.sender.Mutex
 	y.receiver.streamID = 1
 	y.receiver.pending = make(map[uint32]*yPending)
@@ -240,19 +247,21 @@ func (y *yClientConn) writeLoop() {
 		s.Unlock()
 
 		for _, p := range pending {
-			buf.Reset()
-			for _, f := range headers {
-				if err := enc.WriteField(f); err != nil {
+			if *sendHeaders {
+				buf.Reset()
+				for _, f := range headers {
+					if err := enc.WriteField(f); err != nil {
+						log.Fatal(err)
+					}
+				}
+				if err := y.fr.WriteHeaders(http2.HeadersFrameParam{
+					StreamID:      p.streamID,
+					BlockFragment: buf.Bytes(),
+					EndStream:     false,
+					EndHeaders:    true,
+				}); err != nil {
 					log.Fatal(err)
 				}
-			}
-			if err := y.fr.WriteHeaders(http2.HeadersFrameParam{
-				StreamID:      p.streamID,
-				BlockFragment: buf.Bytes(),
-				EndStream:     false,
-				EndHeaders:    true,
-			}); err != nil {
-				log.Fatal(err)
 			}
 
 			if err := y.fr.WriteData(p.streamID, true, p.data); err != nil {
