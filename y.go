@@ -55,9 +55,14 @@ func (y *yServerConn) readLoop() {
 		case *http2.HeadersFrame:
 		case *http2.MetaHeadersFrame:
 		case *http2.DataFrame:
-			go func(streamID uint32, data []byte) {
+			var req PingRequest
+			err := proto.Unmarshal(frame.Data(), &req)
+			if err != nil {
+				log.Fatal(err)
+			}
+			go func(streamID uint32, req PingRequest) {
 				y.send(streamID, &PingResponse{Payload: payload})
-			}(frame.StreamID, frame.Data())
+			}(frame.StreamID, req)
 		case *http2.RSTStreamFrame:
 		case *http2.SettingsFrame:
 		case *http2.PingFrame:
@@ -155,7 +160,7 @@ func doYServer(port string) {
 type yPending struct {
 	streamID uint32
 	data     []byte
-	resp     []byte
+	resp     PingResponse
 	wg       sync.WaitGroup
 }
 
@@ -209,7 +214,10 @@ func (y *yClientConn) readLoop() {
 			p := r.pending[frame.StreamID]
 			delete(r.pending, frame.StreamID)
 			r.Unlock()
-			p.resp = frame.Data()
+			err := proto.Unmarshal(frame.Data(), &p.resp)
+			if err != nil {
+				log.Fatal(err)
+			}
 			p.wg.Done()
 		case *http2.RSTStreamFrame:
 		case *http2.SettingsFrame:
@@ -274,7 +282,7 @@ func (y *yClientConn) writeLoop() {
 	}
 }
 
-func (y *yClientConn) send(m proto.Message) []byte {
+func (y *yClientConn) send(m proto.Message) PingResponse {
 	d, err := proto.Marshal(m)
 	if err != nil {
 		log.Fatal(err)
@@ -312,7 +320,7 @@ func yWorker(y *yClientConn) {
 			log.Fatal(err)
 		}
 		stats.ops++
-		stats.bytes += uint64(len(payload) + len(resp))
+		stats.bytes += uint64(len(payload) + resp.Size())
 		stats.Unlock()
 	}
 }

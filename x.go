@@ -37,11 +37,17 @@ func (x *xServerConn) readLoop() {
 		}
 		size := binary.LittleEndian.Uint32(header[:4])
 		seq := binary.LittleEndian.Uint64(header[4:12])
-		req := make([]byte, size)
-		if _, err := io.ReadFull(rd, req); err != nil {
+		data := make([]byte, size)
+		if _, err := io.ReadFull(rd, data); err != nil {
 			log.Fatal(err)
 		}
 		go func() {
+			// It's safe to access data asynchronously because we're allocating a new
+			// buffer every time.
+			var req PingRequest
+			if err := proto.Unmarshal(data, &req); err != nil {
+				log.Fatal(err)
+			}
 			x.send(seq, &PingResponse{Payload: payload})
 		}()
 	}
@@ -198,7 +204,7 @@ func (x *xClientConn) writeLoop() {
 	}
 }
 
-func (x *xClientConn) send(m proto.Message) []byte {
+func (x *xClientConn) send(m proto.Message) PingResponse {
 	d, err := proto.Marshal(m)
 	if err != nil {
 		log.Fatal(err)
@@ -220,7 +226,13 @@ func (x *xClientConn) send(m proto.Message) []byte {
 	s.Unlock()
 
 	p.wg.Wait()
-	return p.resp
+	// It's safe to access p.resp asynchronously because each response is put
+	// into its own data buffer.
+	var resp PingResponse
+	if err := proto.Unmarshal(p.resp, &resp); err != nil {
+		log.Fatal(err)
+	}
+	return resp
 }
 
 func xWorker(x *xClientConn) {
@@ -236,7 +248,7 @@ func xWorker(x *xClientConn) {
 			log.Fatal(err)
 		}
 		stats.ops++
-		stats.bytes += uint64(len(payload) + len(resp))
+		stats.bytes += uint64(len(payload) + resp.Size())
 		stats.Unlock()
 	}
 }
