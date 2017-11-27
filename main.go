@@ -52,6 +52,9 @@ func doServer(port string) {
 	case "gorpc":
 		doGorpcServer(port)
 
+	case "rpcx":
+		doRPCXServer(port)
+
 	case "x":
 		doXServer(port)
 
@@ -100,6 +103,9 @@ func doClient() {
 
 	case "gorpc":
 		doGorpcClient(addr)
+
+	case "rpcx":
+		doRPCXClient(addr)
 
 	case "x":
 		doXClient(addr)
