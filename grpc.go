@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-var streaming = flag.Bool("g", true, "use a streaming grpc RPC")
+var streaming = flag.Bool("g", false, "use a streaming grpc RPC")
 
 type pinger struct {
 	payload []byte
